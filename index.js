@@ -17,6 +17,18 @@ import {
   const adapter = new JSONFile("db.json");
   const db = new Low(adapter, { servers: {} });
   await db.read();
+  // Normalize legacy shapes and ensure required root keys exist
+  if (!db.data || typeof db.data !== "object") {
+    db.data = { servers: {} };
+  } else {
+    if (!db.data.servers) {
+      db.data.servers = db.data.guilds || {};
+      if (db.data.guilds) {
+        delete db.data.guilds;
+      }
+      await db.write();
+    }
+  }
   
   /* ================= MESSAGE POOLS ================= */
   const MESSAGES = {
@@ -103,7 +115,7 @@ import {
   
   /* ================= DISCORD CLIENT ================= */
   const client = new Client({
-    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages],
+    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.GuildMembers],
     partials: [Partials.Channel],
   });
   
@@ -154,6 +166,7 @@ import {
     if (!interaction.isChatInputCommand()) return;
     const { commandName, guildId } = interaction;
   
+    if (!db.data.servers) db.data.servers = {};
     if (!db.data.servers[guildId]) {
       db.data.servers[guildId] = {
         updateRoom: null,
@@ -176,19 +189,22 @@ import {
         break;
       }
       case "set-language": {
-        conf.language = interaction.options.getString("lang");
+        const lang = interaction.options.getString("lang");
+        conf.language = MESSAGES[lang] ? lang : "en";
         await db.write();
         await interaction.reply(`✅ Language set to ${conf.language}`);
         break;
       }
       case "set-reminder": {
-        conf.reminderHour = interaction.options.getInteger("hour");
+        const hour = interaction.options.getInteger("hour");
+        conf.reminderHour = Math.max(0, Math.min(23, hour));
         await db.write();
         await interaction.reply(`✅ Reminder set to ${conf.reminderHour}:00`);
         break;
       }
       case "set-deadline": {
-        conf.deadlineHour = interaction.options.getInteger("hour");
+        const hour = interaction.options.getInteger("hour");
+        conf.deadlineHour = Math.max(0, Math.min(23, hour));
         await db.write();
         await interaction.reply(`✅ Deadline set to ${conf.deadlineHour}:00`);
         break;
@@ -224,13 +240,19 @@ import {
   
     for (const [guildId, conf] of Object.entries(db.data.servers)) {
       if (hour === conf.reminderHour) {
-        const announceChannel = await client.channels.fetch(conf.announceRoom);
-        announceChannel.send(
-          getRandom(MESSAGES[conf.language].reminder).replace(
-            "{room}",
-            `<#${conf.updateRoom}>`
-          )
-        );
+        if (!conf.announceRoom || !conf.updateRoom) continue;
+        try {
+          const announceChannel = await client.channels.fetch(conf.announceRoom);
+          const lang = MESSAGES[conf.language] ? conf.language : "en";
+          announceChannel.send(
+            getRandom(MESSAGES[lang].reminder).replace(
+              "{room}",
+              `<#${conf.updateRoom}>`
+            )
+          );
+        } catch (err) {
+          console.error("[REMINDER] Failed to send reminder:", err);
+        }
       }
     }
   });
@@ -242,29 +264,35 @@ import {
   
     for (const [guildId, conf] of Object.entries(db.data.servers)) {
       if (hour === conf.deadlineHour) {
-        const guild = await client.guilds.fetch(guildId);
-        const announceChannel = await client.channels.fetch(conf.announceRoom);
-        const updateRoom = await client.channels.fetch(conf.updateRoom);
-  
-        const members = await guild.members.fetch();
-        const missing = members.filter(
-          (m) => !m.user.bot && !conf.updatesToday.includes(m.id)
-        );
-  
-        if (missing.size > 0) {
-          missing.forEach(async (member) => {
-            conf.userMisses[member.id] = (conf.userMisses[member.id] || 0) + 1;
-            announceChannel.send(
-              getEscalation(conf.language, conf.userMisses[member.id], member.id).replace(
-                "{room}",
-                `<#${conf.updateRoom}>`
-              )
-            );
-          });
-        } else {
-          announceChannel.send(getRandom(MESSAGES[conf.language].success));
+        if (!conf.announceRoom || !conf.updateRoom) continue;
+        try {
+          const guild = await client.guilds.fetch(guildId);
+          const announceChannel = await client.channels.fetch(conf.announceRoom);
+          await client.channels.fetch(conf.updateRoom);
+
+          const members = await guild.members.fetch();
+          const missing = members.filter(
+            (m) => !m.user.bot && !conf.updatesToday.includes(m.id)
+          );
+
+          if (missing.size > 0) {
+            missing.forEach(async (member) => {
+              conf.userMisses[member.id] = (conf.userMisses[member.id] || 0) + 1;
+              announceChannel.send(
+                getEscalation(conf.language, conf.userMisses[member.id], member.id).replace(
+                  "{room}",
+                  `<#${conf.updateRoom}>`
+                )
+              );
+            });
+          } else {
+            const lang = MESSAGES[conf.language] ? conf.language : "en";
+            announceChannel.send(getRandom(MESSAGES[lang].success));
+          }
+          await db.write();
+        } catch (err) {
+          console.error("[DEADLINE] Failed to process deadline:", err);
         }
-        await db.write();
       }
     }
   });
